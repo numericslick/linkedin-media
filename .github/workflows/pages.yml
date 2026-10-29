@@ -1,0 +1,169 @@
+# numericslick/linkedin-media (PUBLIC) · .github/workflows/pages.yml
+# Holds only final MP4s (videos/V<n>.mp4). Every push to main rebuilds the whole
+# Pages site from videos/, so every earlier MP4 keeps its URL:
+#   https://numericslick.github.io/linkedin-media/V<n>.mp4
+# and mirrors the files to the "media" branch as an archive/fallback:
+#   https://raw.githubusercontent.com/numericslick/linkedin-media/media/V<n>.mp4
+# Pages source must be "GitHub Actions".
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      files: ${{ steps.site.outputs.files }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Guard repository contents and history
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r -d '' f; do
+            [[ "$f" =~ ^(README\.md|LICENSE|\.github/workflows/pages\.yml|videos/V[0-9]{1,3}\.mp4)$ ]] \
+              || { echo "::error::file not allowed in this public repo: $(printf %q "$f")"; bad=1; }
+          done < <(git ls-tree -r -z --name-only HEAD)
+          [[ $bad -eq 0 ]] || exit 1
+          # Published MP4s are immutable: a change or removal must be declared in each commit
+          # that makes it ("[replace V<n>]" / "[retract V<n>]").
+          if [[ "$EVENT" == "push" && "$BEFORE" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            while read -r c; do
+              msg="$(git log -1 --format=%B "$c")"
+              while IFS=$'\t' read -r st path; do
+                [[ "$path" =~ ^videos/(V[0-9]{1,3})\.mp4$ ]] || continue
+                id="${BASH_REMATCH[1]}"
+                case "$st" in
+                  M) grep -qF "[replace $id]" <<<"$msg" || { echo "::error::$path changed without [replace $id] in $c"; bad=1; } ;;
+                  D) grep -qF "[retract $id]" <<<"$msg" || { echo "::error::$path deleted without [retract $id] in $c"; bad=1; } ;;
+                esac
+              done < <(git diff-tree --no-commit-id -r --name-status "$c" -- videos/)
+            done < <(git rev-list --reverse "$BEFORE..$AFTER")
+          fi
+          [[ $bad -eq 0 ]] || exit 1
+      - name: Validate MP4s
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+          shopt -s nullglob
+          for f in videos/V*.mp4; do
+            out="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height -of csv=p=0 "$f")"
+            [[ "$out" == "h264,1080,1350" ]] || { echo "::error::$f is not a 1080x1350 H.264 video ($out)"; exit 1; }
+            [[ "$(ffprobe -v error -show_entries format=nb_streams -of csv=p=0 "$f")" == 1 ]] || { echo "::error::$f has extra streams"; exit 1; }
+          done
+      - name: Assemble site (all published MP4s, nothing else)
+        id: site
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p _site
+          files=()
+          for f in videos/V*.mp4; do cp -- "$f" _site/; files+=("$(basename "$f"):$(stat -c %s "$f")"); done
+          printf 'User-agent: *\nDisallow: /\n' > _site/robots.txt
+          echo "files=${files[*]:-}" >> "$GITHUB_OUTPUT"
+          echo "Site: ${files[*]:-empty}"
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  verify:
+    needs: [build, deploy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Every published URL serves the same MP4 (video/mp4, expected size)
+        env:
+          FILES: ${{ needs.build.outputs.files }}
+          PAGE_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          set -uo pipefail
+          base="${PAGE_URL%/}"
+          rc=0
+          for entry in $FILES; do
+            name="${entry%%:*}"; size="${entry##*:}"
+            [[ "$name" =~ ^V[0-9]{1,3}\.mp4$ && "$size" =~ ^[0-9]+$ ]] || { echo "::error::bad entry"; rc=1; continue; }
+            ok=0
+            for _ in $(seq 1 20); do
+              read -r code ct len < <(curl -sSIL -o /dev/null -w '%{http_code} %{content_type} %header{content-length}\n' "$base/$name?v=$GITHUB_RUN_ID" || echo "000 - -")
+              if [[ "$code" == 200 && "$ct" == video/mp4* && "$len" == "$size" ]]; then ok=1; break; fi
+              sleep 15
+            done
+            echo "$base/$name -> $code $ct $len (expected $size)" | tee -a "$GITHUB_STEP_SUMMARY"
+            [[ $ok == 1 ]] || { echo "::error::$name not served correctly"; rc=1; }
+          done
+          exit $rc
+
+  archive:
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write     # mirror videos/ to the "media" branch (fallback URLs); GITHUB_TOKEN pushes trigger nothing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Mirror MP4s to media branch
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          src="$RUNNER_TEMP/videos"; mkdir -p "$src"; cp videos/V*.mp4 "$src"/ 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin media >/dev/null; then
+            git fetch -q --depth 1 origin media && git checkout -q -B media FETCH_HEAD
+          else
+            git checkout -q --orphan media
+          fi
+          git rm -rq --cached . >/dev/null 2>&1 || true
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp "$src"/*.mp4 . 2>/dev/null || true
+          touch .nojekyll
+          git add -A .
+          if git diff --cached --quiet; then echo "media branch already up to date"; exit 0; fi
+          git commit -q -m "mirror videos from $GITHUB_SHA"
+          for attempt in 1 2 3; do
+            git push -q origin HEAD:media && exit 0
+            sleep $((attempt * 5)); git fetch -q --depth 1 origin media && git rebase -q FETCH_HEAD || true
+          done
+          echo "::error::mirror push failed"; exit 1
